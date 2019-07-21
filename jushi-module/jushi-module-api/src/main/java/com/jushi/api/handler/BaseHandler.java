@@ -36,7 +36,7 @@ import java.util.function.Function;
  */
 @Slf4j
 public abstract class BaseHandler<Repository extends ReactiveMongoRepository, Entity> {
-    @Autowired
+    @Autowired(required = false)
     private Repository repository;
     /**
      * mongo模板
@@ -119,10 +119,9 @@ public abstract class BaseHandler<Repository extends ReactiveMongoRepository, En
         if (StrUtil.isBlank(id)) {
             CheckUtil.checkEmpty("id", id);
         }
-        return ServerResponse.ok().body(repository.findById(id)
-                        .switchIfEmpty(ServerResponse.ok().body(Mono.just(Result.error(StrUtil.format("id:{} 找不到此数据", id))), Result.class))
-                , entityClass);
-        //查找不到用户
+        Mono<Entity> mono = repository.findById(id);
+        return mono.flatMap(po -> ServerResponse.ok().body(Mono.just(po), entityClass))
+                .switchIfEmpty(ServerResponse.ok().body(Mono.just(Result.error(StrUtil.format("id:{} 找不到此数据", id))), Result.class));
     }
 
 
@@ -154,7 +153,7 @@ public abstract class BaseHandler<Repository extends ReactiveMongoRepository, En
         Mono<Long> count = repository.count();
         return count.flatMap(sums -> {
             if (sums.longValue() == 0) {
-                return sSEReponseBuild(Result.error("无数据"),Result.class);
+                return sSEReponseBuild(Result.error("无数据"), Result.class);
             }
             Flux<Entity> entityFlux = repository.findAll(Sort.by(Sort.Direction.ASC, "_id"));
             return ServerResponse.ok().body(entityFlux, entityClass);
@@ -171,7 +170,7 @@ public abstract class BaseHandler<Repository extends ReactiveMongoRepository, En
     public Mono<ServerResponse> page(ServerRequest request) {
         MultiValueMap<String, String> params = request.queryParams();
         PageQuery pageQuery = BeanUtil.mapToBean(params.toSingleValueMap(), PageQuery.class, false);
-        return pageQuery(Mono.just(pageQuery),query ->{
+        return pageQuery(Mono.just(pageQuery), query -> {
             return getQuery(query);
         }, entityFlux -> {
             return ServerResponse.ok().contentType(MediaType.APPLICATION_JSON_UTF8).body(entityFlux, entityClass);
@@ -187,7 +186,7 @@ public abstract class BaseHandler<Repository extends ReactiveMongoRepository, En
     public Mono<ServerResponse> pageSSE(ServerRequest request) {
         MultiValueMap<String, String> params = request.queryParams();
         PageQuery pageQuery = BeanUtil.mapToBean(params.toSingleValueMap(), PageQuery.class, false);
-        return pageQuery(Mono.just(pageQuery),query ->{
+        return pageQuery(Mono.just(pageQuery), query -> {
             return getQuery(query);
         }, entityFlux -> {
             return sseReturn(entityFlux);
@@ -196,8 +195,8 @@ public abstract class BaseHandler<Repository extends ReactiveMongoRepository, En
 
 
     protected Mono<ServerResponse> pageQuery(Mono<PageQuery> pageQueryMono,
-                                           Function<PageQuery,Query> queryFunction,
-                                           Function<Flux<Entity>, Mono<ServerResponse>> returnFunc) {
+                                             Function<PageQuery, Query> queryFunction,
+                                             Function<Flux<Entity>, Mono<ServerResponse>> returnFunc) {
         return pageQueryMono.flatMap(pageQuery -> {
             checkPage(pageQuery);
             Query query = queryFunction.apply(pageQuery);
@@ -207,7 +206,7 @@ public abstract class BaseHandler<Repository extends ReactiveMongoRepository, En
             return count.flatMap(sums -> {
                 long size = pageQuery.getPage() * pageQuery.getSize();
                 if (sums.longValue() == size) {
-                    return sSEReponseBuild(Mono.just(Result.error("无数据")),Result.class);
+                    return sSEReponseBuild(Mono.just(Result.error("无数据")), Result.class);
                 }
                 //获取数据
                 Flux<Entity> entityFlux = reactiveMongoTemplate.find(with, entityClass);
@@ -217,32 +216,24 @@ public abstract class BaseHandler<Repository extends ReactiveMongoRepository, En
 
     }
 
+    protected <T> Mono<ServerResponse> sseReturn(Flux<T> entityFlux, Class<T> clazz) {
+        Flux<ServerSentEvent> serverSentEventFlux = entityFlux.concatMap(item -> {
+            Object itemId = getId(item);
+            return Mono.just(ServerSentEvent.<Object>builder()
+                    .retry(Duration.ofMillis(1))
+                    .id(getId(item).toString())
+                    .data(item).build());
+        });
+        return sSEReponseBuild(serverSentEventFlux, ServerSentEvent.class);
+
+
+    }
+
     /**
      * sse返回封装
      */
     protected Mono<ServerResponse> sseReturn(Flux<Entity> entityFlux) {
-        Mono<Entity> lastMono = entityFlux.last();
-        Flux<ServerSentEvent> serverSentEventFlux = entityFlux.concatMap(item -> {
-            return lastMono.map(last -> {
-                ServerSentEvent.Builder<Entity> entityBuilder = ServerSentEvent.<Entity>builder()
-                        .retry(Duration.ofDays(1000))
-                        .data(item);
-
-                Object lastId = getId(last);
-                Object itemId = getId(item);
-                log.info("当前值:{}  最终id:{}",item,lastId);
-                //判断是否是最终id
-                if (lastId.equals(itemId)) {
-                    return entityBuilder
-                            .id(getId(item).toString())
-                            .build();
-                }
-                return entityBuilder
-                        .build();
-            });
-        });
-
-        return sSEReponseBuild(serverSentEventFlux, ServerSentEvent.class);
+        return sseReturn(entityFlux, entityClass);
     }
 
     protected <T, P extends Publisher<T>> Mono<ServerResponse> sSEReponseBuild(P publisher, Class<T> elementClass) {
@@ -280,7 +271,7 @@ public abstract class BaseHandler<Repository extends ReactiveMongoRepository, En
      * @param pageQuery
      * @return
      */
-    private Query getQuery(PageQuery pageQuery) {
+    protected Query getQuery(PageQuery pageQuery) {
         Query query = new Query();
         Criteria criteria = new Criteria();
         query.addCriteria(criteria);
@@ -292,7 +283,7 @@ public abstract class BaseHandler<Repository extends ReactiveMongoRepository, En
      *
      * @param pageQuery
      */
-    private void checkPage(PageQuery pageQuery) {
+    protected void checkPage(PageQuery pageQuery) {
         CheckUtil.checkEmpty("页数", pageQuery.getPage());
         CheckUtil.checkEmpty("条数", pageQuery.getSize());
     }
@@ -302,9 +293,9 @@ public abstract class BaseHandler<Repository extends ReactiveMongoRepository, En
      *
      * @param entity
      */
-    private void setId(Entity entity) {
+    private void setId(Object entity) {
         try {
-            Field fieldId = entityClass.getDeclaredField("id");
+            Field fieldId = entity.getClass().getDeclaredField("id");
             fieldId.setAccessible(true);
             fieldId.set(entity, fieldId);
         } catch (IllegalAccessException e) {
@@ -320,9 +311,9 @@ public abstract class BaseHandler<Repository extends ReactiveMongoRepository, En
      * @param entity
      * @return
      */
-    private Object getId(Entity entity) {
+    private Object getId(Object entity) {
         try {
-            Field fieldId = entityClass.getDeclaredField("id");
+            Field fieldId = entity.getClass().getDeclaredField("id");
             fieldId.setAccessible(true);
             return fieldId.get(entity);
         } catch (IllegalAccessException e) {
